@@ -878,6 +878,27 @@ def _build_payload(
     }
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Fail on any 3xx instead of following it. urllib's default handler
+    re-sends the request headers to the redirect target — including
+    `Authorization: Bearer …` and `chatgpt-account-id` — even across origins
+    (issue #56). The Responses endpoint never legitimately redirects, so a 3xx
+    is an error; the message names only the target's origin, since a Location
+    can itself carry a token."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
+        fp.close()
+        raise GatewayError(
+            f"HTTP {code}: the image endpoint redirected to "
+            f"{target.scheme}://{target.netloc}; refusing to follow it so the "
+            f"auth token is not sent there. With --codex-provider, check its base_url.")
+
+
+def _stream_open(req, timeout):  # seam so tests can fake the SSE response
+    return urllib.request.build_opener(_RefuseRedirects).open(req, timeout=timeout)
+
+
 def _stream(
     url: str,
     headers: dict[str, str],
@@ -903,7 +924,7 @@ def _stream(
     )
     # Initial connect timeout: shorter of remaining budget or 30s.
     initial = max(1.0, min(30.0, deadline - time.monotonic()))
-    resp = urllib.request.urlopen(req, timeout=initial)
+    resp = _stream_open(req, timeout=initial)
     # Loosen the per-read timeout: a quiet gap between SSE chunks routinely
     # exceeds the 30s connect timeout, and the overall wall-clock cap is already
     # enforced by the `deadline` check below — so bound the per-read idle window
@@ -1326,6 +1347,19 @@ def _chrome_user_data_dirs() -> list[Path]:
     ]
 
 
+_UNREADABLE_PROFILE_DIRS: set[Path] = set()
+
+
+def _warn_unreadable_profiles(base: Path, err: OSError) -> None:
+    """One stderr note per unreadable Chrome data dir, however often we scan."""
+    if base in _UNREADABLE_PROFILE_DIRS:
+        return
+    _UNREADABLE_PROFILE_DIRS.add(base)
+    print(f"   .. warning: can't read Chrome profiles in {base} ({err.strerror or err}); "
+          "skipping profile detection. On macOS, grant your terminal Full Disk "
+          "Access, or use --profile relay.", file=sys.stderr)
+
+
 def _detect_logged_in_profiles(
     host_like: str = "%chatgpt.com%",
     name_clause: str = "name LIKE '__Secure-next-auth.session-token%'",
@@ -1346,13 +1380,23 @@ def _detect_logged_in_profiles(
     chrome_now_us = (time.time() + 11644473600) * 1_000_000
     found: list[tuple[str, int]] = []
     for base in _chrome_user_data_dirs():
-        if not base.is_dir():
+        # macOS privacy protection (no Files and Folders / Full Disk Access for
+        # the terminal) makes Chrome's data dir unreadable with EPERM, which
+        # `is_dir()` / `iterdir()` raise rather than swallow (issue #58). Treat
+        # it as "no profiles here" so auto mode falls back to the relay.
+        try:
+            profs = list(base.iterdir()) if base.is_dir() else []
+        except OSError as e:
+            _warn_unreadable_profiles(base, e)
             continue
-        for prof in base.iterdir():
-            if not prof.is_dir() or not (prof / "Preferences").exists():
+        for prof in profs:
+            try:
+                if not prof.is_dir() or not (prof / "Preferences").exists():
+                    continue
+                db = next((c for c in (prof / "Network" / "Cookies", prof / "Cookies")
+                           if c.exists()), None)
+            except OSError:
                 continue
-            db = next((c for c in (prof / "Network" / "Cookies", prof / "Cookies")
-                       if c.exists()), None)
             if not db:
                 continue
             tmp = None
@@ -6213,6 +6257,19 @@ def _recover_command(argv: list[str]) -> int:
                                        "and no image is there yet; try again in a minute.")
                 raise GatewayError("that conversation has no generated image.")
             title = res.get("title") or "recovered"
+            if args.out:
+                # `-o` itself is overwritten, as in a generation, but the derived
+                # NAME-2.ext… were never asked for: refuse before writing
+                # anything rather than clobber unrelated files (issue #57).
+                base_out = Path(args.out)
+                clash = [str(p) for p in (base_out.with_name(
+                    f"{base_out.stem}-{n}{base_out.suffix}")
+                    for n in range(2, len(images) + 1)) if p.exists()]
+                if clash:
+                    raise GatewayError(
+                        f"the conversation has {len(images)} images and these "
+                        f"targets already exist: {', '.join(clash)}. Pick another "
+                        f"-o name, or omit -o to get free names.")
             for n, img in enumerate(images, 1):
                 url = img.get("download_url")
                 if not url:

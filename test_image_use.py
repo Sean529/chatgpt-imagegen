@@ -2804,6 +2804,33 @@ class GoogleProfileDetection(unittest.TestCase):
                       sig.parameters["name_clause"].default)
 
 
+class UnreadableProfileDir(unittest.TestCase):
+    """Issue #58: a privacy-protected Chrome dir means "no profiles", not a crash."""
+
+    def test_permission_error_is_skipped_with_one_warning(self):
+        locked = unittest.mock.MagicMock()
+        locked.is_dir.return_value = True
+        locked.iterdir.side_effect = PermissionError(1, "Operation not permitted")
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as empty, \
+             unittest.mock.patch.object(cig, "_chrome_user_data_dirs",
+                                        lambda: [locked, Path(empty)]), \
+             unittest.mock.patch.object(cig, "_UNREADABLE_PROFILE_DIRS", set()), \
+             redirect_stderr(err):
+            self.assertEqual(cig._detect_logged_in_profiles(), [])
+            self.assertEqual(cig._detect_google_profiles(), [])
+        self.assertEqual(err.getvalue().count("can't read Chrome profiles"), 1)
+        self.assertIn("Operation not permitted", err.getvalue())
+
+    def test_is_dir_raising_is_skipped_too(self):
+        locked = unittest.mock.MagicMock()
+        locked.is_dir.side_effect = PermissionError(1, "Operation not permitted")
+        with unittest.mock.patch.object(cig, "_chrome_user_data_dirs", lambda: [locked]), \
+             unittest.mock.patch.object(cig, "_UNREADABLE_PROFILE_DIRS", set()), \
+             redirect_stderr(io.StringIO()):
+            self.assertEqual(cig._detect_logged_in_profiles(), [])
+
+
 class RefRoles(unittest.TestCase):
     """issue #26 — an ad-hoc --ref must be expressible as style/composition,
     not only as the canonical subject."""
@@ -3020,7 +3047,7 @@ class StallTimeoutZero(unittest.TestCase):
             def close(self):
                 pass
 
-        with unittest.mock.patch.object(cig.urllib.request, "urlopen",
+        with unittest.mock.patch.object(cig, "_stream_open",
                                         lambda *a, **kw: FakeResp()), \
              unittest.mock.patch.object(
                  cig, "_loosen_read_timeout",
@@ -3028,6 +3055,44 @@ class StallTimeoutZero(unittest.TestCase):
             list(cig._stream("https://x", {}, {},
                              time.monotonic() + 300.0, stall_timeout))
         return seen["t"]
+
+    def test_redirects_are_refused_so_the_token_stays_put(self):
+        """Issue #56: a 302 to another origin must not re-send Authorization."""
+        import http.server
+
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits.append(("POST", self.path, self.headers.get("Authorization")))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(302)
+                self.send_header("Location", f"http://localhost:{port}/stolen?t=1")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):
+                hits.append(("GET", self.path, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        with self.assertRaises(cig.GatewayError) as ctx:
+            list(cig._stream(f"http://127.0.0.1:{port}/responses",
+                             {"Authorization": "Bearer secret-token"}, {},
+                             time.monotonic() + 30.0, 10.0))
+        self.assertEqual(hits, [("POST", "/responses", "Bearer secret-token")])
+        msg = str(ctx.exception)
+        self.assertIn(f"http://localhost:{port}", msg)
+        self.assertNotIn("stolen", msg)
 
     def test_zero_falls_back_to_the_remaining_budget_not_a_zero_socket(self):
         # A 0 socket timeout means non-blocking: every read would fail at once.
@@ -4387,6 +4452,26 @@ class RecoverCommand(unittest.TestCase):
         self.assertTrue(all(s == "chatgpt-web" for _, s in self.evals))
         self.assertIn("file_b", self.evals[1][0])
         self.assertEqual(self.ab_calls, [("close",)])
+
+    def test_derived_names_never_overwrite_existing_files(self):
+        """Issue #57: an unrelated fox-2.png survives and nothing is downloaded."""
+        Path("fox-2.png").write_bytes(b"keep me")
+        res = {"finished": True, "title": "fox", "images": [self._image("file_a"), self._image("file_b")]}
+        rc, out, err, _ = self._recover(res, "-o", "fox.png", "--quiet")
+        self.assertEqual(rc, 1)
+        self.assertIn("fox-2.png", err)
+        self.assertEqual(Path("fox-2.png").read_bytes(), b"keep me")
+        self.assertFalse(Path("fox.png").exists())
+        self.assertEqual((out, self.evals), ("", []))
+        self.assertEqual(self.ab_calls, [("close",)])
+
+    def test_explicit_out_is_overwritten_like_a_generation(self):
+        """-o itself keeps generate's semantics: the named file is replaced."""
+        Path("fox.png").write_bytes(b"old")
+        res = {"finished": True, "title": "fox", "images": [self._image("file_a")]}
+        rc, out, err, _ = self._recover(res, "-o", "fox.png", "--quiet")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(Path("fox.png").read_bytes(), self.PNG)
 
     def test_default_name_comes_from_the_title_and_the_bytes(self):
         """octet-stream content still lands as .png, named after the chat."""
