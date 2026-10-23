@@ -67,13 +67,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-__version__ = "0.34.3"
+__version__ = "0.34.4"
 
 # What's-new, newest first — one terse line per release. The update reminder
 # surfaces these so a user learns WHAT changed, not just that a newer version
 # exists. Kept as flat, easy-to-regex comments near the top so the remote copy
 # can be parsed from the same 8KB prefix the reminder already reads — no extra
 # file to drift, no import needed. Format: `# WHATSNEW[<version>]: <summary>`.
+# WHATSNEW[0.34.4]: Fix reference-image uploads in the four-input ChatGPT composer and handle Windows output encoding while preserving exact saved paths (#60, #62; thanks @IndelibleVivi and @chevalG).
 # WHATSNEW[0.34.3]: The skill now lives in skills/image-use/ with its own copy of the CLI, so Claude Code and Codex find it and a copied skill folder works on its own; upgrades from a Codex plugin cache are left to the plugin manager.
 # WHATSNEW[0.34.2]: Stop the Codex stream from sending your token through redirects, keep recover from overwriting existing NAME-2 files, and stop --profile auto crashing when macOS blocks Chrome's profile folder.
 # WHATSNEW[0.34.1]: Fix reference image uploads in the redesigned ChatGPT composer: select the media input instead of the camera input, and recognize decoded data-image attachments only when Send is enabled and uploads are idle (#55, thanks @lifegit)
